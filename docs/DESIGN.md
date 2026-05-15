@@ -569,6 +569,20 @@ the UI is a container-wrapped OS service that **cannot** mount
 tmp_ramfs directly. UNIX socket is the chosen surface. No Redis
 mirror, no HTTP server, no ramfs mount into the container.
 
+## 0. Implementation language
+
+**Decision (operator A2, 2026-05-15): C.** Same toolchain as
+wskop_v01. The bridge has no DPDK dependency (it links neither
+`librte_*` nor any wskop symbol), but a C codebase lets the same
+build chain produce the satellite binary and reuses operator
+familiarity with the project's idioms. The satellite repo's
+`daemon/` directory is structured as a C source tree.
+
+The contract itself is language-agnostic; if a future v2 of the
+bridge wants to switch to Rust or Go for the smaller bug surface
+on JSON parsing, the wire protocol's externally-observable
+behaviour stays the same. v1 is C.
+
 ## 1. Lifetime: sibling systemd service
 
 Two candidate shapes:
@@ -764,6 +778,65 @@ When `wskop-wsi@<i>.service` restarts:
   ([03 §3](03_wire_protocol.md) details subscribe semantics).
 - New clients announce a protocol version on connect; mismatch is
   an error response ([03 §2](03_wire_protocol.md)).
+
+### 5.4 Bridge auto-detects wskop restarts (per operator Q7)
+
+**Decision (operator A7, 2026-05-15):** the bridge actively
+detects wskop restarts and notifies subscribed clients. This was
+flagged as observation in [07 §11](07_observations.md); the
+operator promoted it to spec.
+
+**Mechanism.** On startup, the bridge reads
+`system/start_time` and stores the value as
+`last_known_start_time_seconds`. The bridge re-reads
+`system/start_time` on every polling tick (1 Hz default for
+v1 polled subscribes; on demand for one-shot `get`). When the
+new value > stored, the bridge:
+
+1. Updates `last_known_start_time_seconds`.
+2. **Pushes an unsolicited event** to every connected client
+   (regardless of subscribe set):
+   ```json
+   { "v":1, "kind":"event",
+     "event": {
+       "type":"wskop_restart",
+       "previous_start_time": 1778751156,
+       "new_start_time":      1778834567 } }
+   ```
+   The frame omits `id` because it is unsolicited (per the
+   protocol's optional-on-events rule in
+   [03 §2](03_wire_protocol.md)).
+3. **Discards any in-flight per-subscription rate state** (e.g.
+   "last `last_seen_tsc` we saw for flow N") so the next push
+   doesn't claim a synthetic delta.
+
+**On the client (UI) side.** On receiving `event.type=="wskop_restart"`:
+
+- Refresh the manifest via `kind="manifest"` — schema may or may
+  not have changed; safe to assume it did and refetch.
+- Reset any local "previous sample" caches the UI uses to compute
+  rates. The counters reset to 0 on wskop restart per
+  [05 §3.2](05_counter_semantics_manifest.md) (`monotonic_nondecreasing`
+  resets are a known restart side-effect).
+- Re-issue any active `subscribe` calls if the protocol has been
+  decided to drop them on a restart event. **v1 leaves them
+  alive** — the bridge does not invalidate client subscribes on
+  detection; the next pushed `values` frame just carries the new
+  (reset) values. UI computes rates from the next two samples
+  onward.
+
+**Edge case — start_time decreases.** If
+`system/start_time` ever returns a value less than the stored
+one (impossible under normal operation; would indicate clock
+skew or a corrupted file), the bridge treats it as a restart and
+re-emits the event. The clock-skew case is rare on a wskop host;
+the corrupted-file case is caught by `value_parse_failure`
+elsewhere ([03 §4](03_wire_protocol.md)).
+
+**Implementation cost.** One `read()` per polling tick on the
+existing `system/start_time` file — already in the polled set
+for clients that subscribe to `system/`. No new resource;
+bridge keeps the value cached.
 
 ## 6. Ramfs reads: on-demand vs cached
 
@@ -1215,6 +1288,18 @@ Successful responses:
 - `kind="list"` — for `list`
 - `kind="subscribed"` / `kind="unsubscribed"` — for subscribe ack
 - `kind="pong"` — for ping
+- `kind="event"` — **unsolicited** server-pushed events, no `id`.
+  Currently defined event types:
+  - `event.type="wskop_restart"` — bridge detected
+    `system/start_time` advance. Carries `previous_start_time`
+    and `new_start_time` (both `epoch_seconds`). See
+    [02 §5.4](02_bridge_daemon_design.md) for the bridge-side
+    detection mechanic and the UI-side reset. Pushed to **every**
+    connected client regardless of subscribe set.
+
+  Future event types are added in additive bumps of the manifest's
+  `schema_version` (not the protocol `v`); the UI should ignore
+  unknown event types gracefully.
 
 Errors:
 
@@ -1277,6 +1362,17 @@ have to introduce it later.
   counter into `uint64_string` when it is known to exceed the safe
   integer range. Cumulative byte counters (the only ones at risk)
   use `uint64_string`.
+
+  **Python UI note (per operator A10, 2026-05-15):** Python's
+  stdlib `json` parses arbitrary-precision JSON numbers into
+  Python `int` without precision loss, so `type="uint64"` for
+  values above `2^53` also works in Python (unlike a Node UI
+  where any number above `2^53` silently rounds to `float`).
+  The contract still **prefers `uint64_string` for cumulative
+  byte counters** so the wire format is portable to a future
+  Node frontend without schema change. Python parses both forms
+  cleanly via `int(value)` when `type="uint64_string"` and
+  direct on `type="uint64"`.
 
 - **Strings** (e.g. `system/version`) serialise as JSON strings,
   trimmed of the trailing newline that
@@ -1679,7 +1775,9 @@ meaningful regardless of the other bits' state.
 strict consistency across multiple `policy_info`-derived fields
 can read-recheck-or-retry. Out of scope.)
 
-## 8. Unwatch is `unset_watched` everywhere set_watched runs
+## 8. Unwatch and retention semantics
+
+### 8.1 Unwatch is `unset_watched` everywhere set_watched runs
 
 - Operator unmarks a subscriber → redis_cli walks `flow_list`,
   `unset_watched(&flow_d->policy_info)` on each.
@@ -1692,6 +1790,55 @@ can read-recheck-or-retry. Out of scope.)
 `set_watched`. The aggregate counter
 `watch/watched_flow_count` falls when the watch lcore's next
 1 s walk sees fewer matches.
+
+### 8.2 Retention across wskop restart, flow aging, subscriber unmark
+
+**Decision (operator A13, 2026-05-15):** the three persistence
+cases behave as follows. Implementation phase tests against this
+table.
+
+| Event | Per-flow `WATCHED_BIT` survives? | Subscriber `watched` survives? | Result |
+|---|---|---|---|
+| **wskop restart** | **no** — per-flow state is rebuilt from scratch on the new process; `flow_info_d` is reinitialised | **yes** — `subscriber_info` state is restored from Redis at startup (the standard subscriber-cache restore path); the field comes back if the Redis source carries it | New flows of a still-watched subscriber inherit the bit at flow creation per §3.3. Pre-restart explicit per-flow marks are **lost** (no Redis-backed mirror); operator re-marks if they want them back. |
+| **flow aging** | **yes**, until the flow is reaped | n/a | The bit stays with the flow until the flow record dies. After aging, a new flow with the same 5-tuple gets the bit only if the **subscriber** is watched (the §3.3 path). |
+| **subscriber unmark** | **yes** — flow-level bits on existing flows persist until an explicit `unset_watched` walk runs | n/a | Explicit per-flow marks outlive the subscriber-level mark. The operator's choice "watch this one flow" is honoured even after the subscriber is no longer watched globally. New flows of that subscriber do **not** inherit the bit (subscriber `watched=0`). |
+
+The third row is the load-bearing semantic — it's also the one
+that surprises most. The reading:
+
+- Per-subscriber watch is a **rule** ("future flows of S are
+  interesting"); changing the rule shouldn't retroactively undo
+  explicit per-flow operator actions.
+- Per-flow watch is a **fact** ("this specific flow is being
+  watched right now"); only an explicit per-flow unmark clears
+  it.
+
+**Implementation implication.** The per-subscriber unmark path
+(§3.2 of this file) **only modifies `subscriber_info.watched`**.
+It does **not** walk `subscriber->flow_list` to unset bits. The
+per-flow unmark path (§3.1) walks one flow and unsets the bit.
+The per-subscriber **mark** path still walks the list and sets
+the bit (so existing flows of a newly-watched subscriber become
+visible immediately). Asymmetry is by design.
+
+If an operator wants to "unmark subscriber S and clear all its
+existing flow marks too," that is two UI gestures: unmark
+subscriber + per-flow unmark walk. A future v2.1 might add a
+combined gesture; out of scope for v1.
+
+### 8.3 The aggregate counters track all three cases correctly
+
+- `watch/watched_flow_count` re-counts on every watch tick, so
+  wskop restart resets it (per-flow state lost), flow aging
+  reduces it (matching flow gone), and per-flow unmark reduces
+  it (bit cleared).
+- `watch/watched_subscriber_count` counts subscribers with
+  `watched==1`, which survives wskop restart via the Redis
+  restore; it does **not** change on flow aging or per-flow
+  marks.
+
+UI consumers reading both counters together get a consistent
+picture under all three event types.
 
 ## 9. Test plan (for the implementation phase)
 
@@ -2048,22 +2195,46 @@ release on the same day. Bumped when:
 
 ## 6. How the manifest gets generated
 
-Out of scope for the design phase, but pinned for the
-implementation phase to choose between:
+**Decision (operator A1, 2026-05-15): (c) hybrid.** The
+implementation phase ships a small generator script in
+`wskop_bridge_v01/scripts/generate_manifest.<py|sh>` that:
 
-- **(a)** Hand-written JSON, checked into `wskop_bridge_v01/manifests/`,
-  installed by `install.sh`. Simple; updates require an edit + a
-  commit.
-- **(b)** Code-generated from the wskop source. A small extractor
-  reads `metrics_register` call sites in `wskop.c` and emits the
-  manifest. Tracks reality automatically; requires the extractor.
-- **(c)** Hybrid: hand-written for descriptions / units / status,
-  code-generated path list (the bridge daemon refuses paths not
-  in the manifest, so the lists must agree).
+1. **Code-generated path list.** Walks `wskop_v01/wskop.c` (and
+   any future contributors to `metrics_register` calls) and
+   extracts the `(role, counter_name)` pairs. Maps them to
+   concrete paths against the instance's worker / shaper /
+   transmit count (from
+   [`/etc/wskop-wsi/<instance>.json`](../dpi_config_ingest_discovery/01_config_file_inventory.md)).
+2. **Hand-written semantics.** Reads
+   `wskop_bridge_v01/manifests/<instance>.semantics.json`
+   (versioned in git) which carries `description`, `unit`,
+   `status`, `monotonicity`, `legacy_name`, `anomalies` per
+   counter name (not per concrete path — the generator
+   broadcasts the per-name semantics across all matching
+   concrete paths).
+3. **Emits** `/etc/wskop-wsi/<instance>.bridge_manifest.json`,
+   merging (1) and (2). Bumps `schema_version` if a counter was
+   added/removed since the last run (the generator stores a
+   previous-run cache for diffing).
 
-**(c) is the implementation phase's call.** Either (a) or (c)
-works for v1. The contract just requires that the published file
-exists and contains the fields specified above.
+**CI gate.** A `check_manifest.sh` script runs in CI on
+`wskop_v01` PRs that touch `metrics_register`: it runs the
+generator against the touched commit and fails if a new counter
+is added without a corresponding hand-written semantics entry.
+This catches "added a counter, forgot to document it" before
+merge.
+
+This shape was chosen because:
+
+- Option (a) (hand-written only) drifts silently — easy to add a
+  new `metrics_register` and forget the manifest.
+- Option (b) (code-generated only) can't infer `description`,
+  `status` (live / expected_zero / not_wired / deprecated), or
+  anomaly linkage from the source.
+- (c) lets both halves do what they're best at and gates the
+  combined output via the CI script.
+
+Alternatives (a) and (b) were considered and rejected.
 
 ## 7. Example manifest excerpt (illustrative; not exhaustive)
 
@@ -2930,7 +3101,10 @@ For the implementation phase or the operator. Questions that had
 a discoverable code answer were resolved into 01-06, not left
 here.
 
-Each question lists who I think can answer it.
+Each question lists who I think can answer it. **Operator answers
+2026-05-15 are inlined under each question** below; load-bearing
+decisions have been folded back into the corresponding files
+01-06.
 
 ## For the implementation phase
 
@@ -2949,6 +3123,11 @@ status be maintained in source review.
 Stakes: low. Either (a) or (c) ships v1; (b) is awkward because
 it can't infer `description` / `status` / `anomaly` linkage.
 
+**A (operator, 2026-05-15):** **(c) hybrid.** Folded into
+[05 §6](05_counter_semantics_manifest.md): the manifest
+generator is code-driven for the path list, hand-written for
+descriptions / `status` / anomaly linkage.
+
 ### Q2. Bridge daemon implementation language
 
 C, Rust, Go, or other? The wskop tree is C. The bridge does not
@@ -2963,6 +3142,10 @@ in the implementation team; otherwise Rust or Go for the smaller
 bug surface. Not a contract concern; satellite repo's `daemon/`
 directory can host either.
 
+**A (operator, 2026-05-15):** **C.** Same toolchain as wskop_v01.
+Folded into [02 §1](02_bridge_daemon_design.md). Satellite repo's
+`daemon/` directory will be a C source tree.
+
 ### Q3. `ports/` vs extended `system/<port_N>/` directory naming
 
 Per [01 §1.2](01_v1_producer_additions.md): per-port DPDK stats
@@ -2972,6 +3155,9 @@ go under either `ports/port_<P>/` (new top-level role) or
 long as the manifest path strings match.
 
 Stakes: low. `ports/` is slightly cleaner; either is consistent.
+
+**A (operator, 2026-05-15):** **`ports/` is fine.** No change to
+[01 §1.2](01_v1_producer_additions.md).
 
 ### Q4. `cmon_register_core` on shaper / transmit — wire now or defer?
 
@@ -2993,6 +3179,11 @@ heartbeats carry `status="not_wired"` and the bridge returns
 Owner: whoever owns `ssg_src/profiling/` per CLAUDE.md
 "profiling broken, needs refactor."
 
+**A (operator, 2026-05-15):** **ship v1 without.** Confirms the
+default. Shaper/transmit heartbeat counters keep
+`status="not_wired"` in the manifest until someone wires
+`cmon_register_core` on those roles as a separate workstream.
+
 ### Q5. Stop-gap consumer for v2 if the broker slips
 
 Per [06 §8](06_v2_streaming_layer.md). My recommendation in
@@ -3011,6 +3202,13 @@ budget?"
 Re-decision trigger: revisit when task (e) ships W1 of its own
 or formally slips a quarter.
 
+**A (operator, 2026-05-15):** **no shipping v2 before the
+broker.** v2 producer-side hot-path enqueue (W5 in
+[06 §7](06_v2_streaming_layer.md)) does not land ahead of the
+broker. v1's `watched_flow_count` / `watched_subscriber_count`
+at 1 Hz covers the UI need until the broker arrives. Re-decision
+trigger above is also retired — the policy is now "wait."
+
 ### Q6. Wire protocol error code naming
 
 [03 §4](03_wire_protocol.md) lists 9 error codes. The
@@ -3024,6 +3222,9 @@ chosen.
 test ([07 §8](07_observations.md)) and bump
 `schema_version`-style if any rename is needed later.
 
+**A (operator, 2026-05-15):** **error code naming is fine
+as-is.** Lock in with the first golden-fixture test.
+
 ### Q7. Whether the bridge should auto-detect wskop restarts
 
 Per [07 §11](07_observations.md): bridge monitors
@@ -3036,6 +3237,15 @@ detection client-side from the `system/start_time` value.
 **Open** if v1 wants to ship this feature or punt to v1.1. I lean
 punt.
 
+**A (operator, 2026-05-15):** **ship the auto-detect in v1.**
+The bridge monitors `system/start_time` and emits a synthetic
+`kind="event"` with `event.type="wskop_restart"` to all
+connected clients on observing the value advance. UI consumers
+refresh the manifest + reset local caches on receipt. Promoted
+from observation
+([07 §11](07_observations.md)) to spec in
+[02 §5.4](02_bridge_daemon_design.md).
+
 ### Q8. Subscribe rate-cap and limit
 
 [03 §3.4](03_wire_protocol.md) clamps `interval_seconds` to
@@ -3044,6 +3254,10 @@ Implementation may want these as config flags rather than
 hardcoded.
 
 **Stakes: low.** Reasonable defaults; tune as needed.
+
+**A (operator, 2026-05-15):** **figures are fine.** `[1.0, 60.0]`
+clamp on `interval_seconds` and 16-subscribe cap per client land
+as the v1 defaults; revisit only if a workload exercises them.
 
 ### Q9. Bridge daemon's stance on the schema-version mismatch
 
@@ -3056,6 +3270,12 @@ cares.
 **Open** whether the bridge should bounce stale clients or be
 lenient. **Recommendation: lenient.** Force the UI to be the
 source of truth on freshness.
+
+**A (operator, 2026-05-15):** **lenient.** Bridge accepts
+requests as long as wire protocol `v` matches; manifest
+`schema_version` mismatch is the UI's concern. The UI refreshes
+the manifest after a `kind="wskop_restart"` event (Q7) or on
+schedule.
 
 ## For the operator
 
@@ -3073,6 +3293,32 @@ parses both seamlessly.
 explicitly. Knowing the UI runtime helps tune the default for
 new counters (which type to assign in the manifest).
 
+**A (operator, 2026-05-15):** **Python.**
+
+**Technical implications — none restrictive.** Python's `int` is
+arbitrary-precision and Python's stdlib `json` parses both JSON
+numbers and JSON strings without precision loss, so the
+contract's `type: "uint64"` (JSON number) and `type: "uint64_string"`
+(JSON string of decimal) both decode cleanly in Python. Concretely:
+
+- `json.loads('{"v": 9007199255000000}')['v']` → `9007199255000000`
+  (Python `int`, exact). No `float` cast happens unless the UI
+  code does it explicitly.
+- `json.loads('{"v": "9007199255000000"}')['v']` → `"9007199255000000"`;
+  the UI calls `int(...)` to widen.
+
+The asymmetry between Node (where any number > 2^53 silently
+loses precision unless serialised as a string) does not apply.
+Recommendation for the manifest in
+[05 §3.5](05_counter_semantics_manifest.md): **continue to use
+`uint64_string` for byte-cumulative counters** (the safer
+default), but the manifest is free to use plain `uint64` for
+anything bounded under 2^53 (most counters in practice). The UI
+handles both.
+
+If the UI later swaps to a Node frontend, this choice protects
+it; if the UI stays Python, neither form is wrong.
+
 ### Q11. Bind-mount path conventions in the UI container
 
 The bridge socket is at `/run/wskop-wsi/<instance>/bridge.sock`
@@ -3082,6 +3328,13 @@ container bind-mounts it — but at what path inside the container?
 `/run/wskop-bridge.sock`? `/var/run/wskop/<instance>.sock`?
 This is a deployment convention, not a contract concern, but
 worth pinning before the UI starts looking for it.
+
+**A (operator, 2026-05-15):** **yes — pin before the UI starts
+looking.** Specific path is a deployment-phase decision; the
+contract doesn't constrain it. Implementation phase records the
+chosen path in the `wskop_bridge_v01` install script + the UI
+deployment doc together; both sides agree before either codes
+against it.
 
 ### Q12. Manifest distribution to the UI
 
@@ -3095,6 +3348,12 @@ container) as a back-up if the bridge is unreachable?
 I would not. The bridge is the runtime source of truth; if it is
 unreachable the UI shouldn't pretend to know what the data shape
 is. **Confirm.**
+
+**A (operator, 2026-05-15):** **confirmed.** The UI does not
+fall back to the build-time `/etc/wskop-wsi/<instance>.bridge_manifest.json`
+on bridge unreachability. Bridge is the single source of truth;
+when it is unreachable the UI shows a "bridge unavailable" state
+rather than serving stale shape metadata.
 
 ### Q13. Watched-flow / watched-subscriber retention semantics
 
@@ -3117,6 +3376,28 @@ across:
 The contract behaves correctly under all three readings of §3.2;
 the operator should choose the semantics consciously.
 
+**A (operator, 2026-05-15):**
+
+- **(a) wskop restart: no.** Per-flow watched bits do not survive
+  wskop restart; per-flow state is rebuilt fresh on the new
+  process. The subscriber-side `watched` flag on
+  `subsc_w_prb_ref` survives because subscriber state is restored
+  from Redis at startup, so new flows of a watched subscriber
+  inherit the bit at flow creation — same shape as (c) below.
+- **(b) flow aging: yes.** The bit persists with the flow until
+  the flow is reaped. After aging, a new flow with the same
+  5-tuple gets the bit only if the subscriber is watched (the
+  §3.3 path in [04](04_watched_flag_and_propagation.md)).
+- **(c) subscriber unmark: subscriber-unmark behaviour as
+  described** — flow-level bits on existing flows persist until
+  an explicit `unset_watched` walk; new flows of that subscriber
+  do not get the bit. Explicit per-flow marks outlive the
+  subscriber-level mark.
+
+Folded into [04 §8 (Unwatch)](04_watched_flag_and_propagation.md)
+as an explicit retention/persistence section so the implementation
+phase has the semantics in one place.
+
 ### Q14. Does the contract need a "drain" / "snapshot" operation for the UI?
 
 The UI may want to capture a full state snapshot for an incident
@@ -3129,6 +3410,11 @@ For v2's streaming events, "snapshot" is murkier — a UI saying
 a one-shot "emit one record per currently-watched flow" pulse.
 Not in v2's scope as designed; **flag for v2.1 if the UI wants
 it.**
+
+**A (operator, 2026-05-15):** **defer to v2.1; not urgent.**
+v1's enumerate-the-manifest + bulk `get` covers the polled
+snapshot need. The streaming "one-shot drain" is a future
+enhancement.
 
 ## Hygiene / refactor questions (lower priority)
 
@@ -3146,6 +3432,12 @@ write-back control channel for "watch flow N" gestures separate
 from Redis, `simple_cli` is the place. **Not the bridge.** This
 is a separate design phase.
 
+**A (operator, 2026-05-15):** **no revival. `simple_cli` will be
+removed.** The runtime contract bridge stays read-only;
+write-back gestures continue to flow through the existing Redis
+command channel. Removal of `simple_cli` from wskop is its own
+cleanup task, out of scope here.
+
 ### Q17. The `flow_info_d` SERVICE_KEY overrun
 
 Per [discovery 08 Q3](../dpi_runtime_data_contract_discovery/08_open_questions.md#q3).
@@ -3155,6 +3447,10 @@ separate inspection PR** if anyone is touching `bit_operations.c`.
 At HEAD the implementation is missing entirely (declarations only
 in the header), which makes it even safer than the discovery
 suggested.
+
+**A (operator, 2026-05-15):** **acknowledged (informational).**
+Hygiene-only; doesn't block bit-38 claim or any other part of
+the contract.
 
 ### Q18. The IPDR cadence bug
 
@@ -3167,6 +3463,24 @@ phase ships.
 The contract's manifest carries the `ipdr_cadence_1000x` anomaly
 entry until the fix lands; on fix, the anomaly is removed and
 `schema_version` bumps.
+
+**A (operator, 2026-05-15):** **acknowledged (informational).**
+Same posture as Q17 — the contract carries the anomaly entry in
+its manifest until the upstream fix lands.
+
+## Summary — what is left open
+
+After the 2026-05-15 operator answers, all 18 questions are
+resolved. Load-bearing decisions are folded into 01-06. **Open
+items remaining for the implementation phase are operational
+choices** that don't change the contract's shape:
+
+- Concrete bind-mount path for the UI container side (Q11) —
+  agree at deployment time.
+- Specific manifest generator script (Q1 / [05 §6](05_counter_semantics_manifest.md))
+  — hybrid generator code lives in `wskop_bridge_v01/scripts/`.
+
+Nothing else is awaiting an answer to start implementation.
 
 ## Out of scope (called out explicitly)
 
