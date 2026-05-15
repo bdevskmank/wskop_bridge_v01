@@ -1,0 +1,25 @@
+{
+  "name": "ping_pong",
+  "description": "Basic liveness check. Verifies the bridge accepts a kind=\"ping\" and replies with kind=\"pong\" carrying schema_version, wskop_version, and epoch_ms.",
+  "exchanges": [
+    {
+      "direction": "client_to_server",
+      "frame": {
+        "v": 1,
+        "id": "h",
+        "kind": "ping"
+      }
+    },
+    {
+      "direction": "server_to_client",
+      "frame": {
+        "v": 1,
+        "id": "h",
+        "kind": "pong",
+        "epoch_ms": "<any uint64>",
+        "schema_version": "<any string>",
+        "wskop_version": "<any string>"
+      }
+    }
+  ]
+}

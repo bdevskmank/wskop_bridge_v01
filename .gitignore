@@ -1,0 +1,19 @@
+# Build artifacts (regardless of language choice)
+build/
+target/
+out/
+*.o
+*.a
+*.so
+*.exe
+wskop-bridge
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Test artifacts
+test-results/
+*.log
